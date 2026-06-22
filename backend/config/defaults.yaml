@@ -1,0 +1,19 @@
+# Enum defaults seeded per client. Add/remove values here,
+# then re-run seeding. The pipeline reads from the DB, not this file.
+
+creative_types:
+  - talking-head
+  - UGC
+  - listicle
+  - story
+  - demo
+  - skit
+  - interview
+  - testimonial
+  - walkthrough
+
+lead_types:
+  - problem-led
+  - proof-led
+  - curiosity-led
+  - offer-led
