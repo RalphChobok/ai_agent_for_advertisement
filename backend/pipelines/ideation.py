@@ -219,6 +219,7 @@ async def find_closest_existing_idea(
     conn: asyncpg.Connection,
     client_id: uuid.UUID,
     embedding_str: str,
+    exclude_idea_id: uuid.UUID,
 ) -> dict | None:
     """Return the single closest existing idea regardless of threshold.
     Used to populate the dedup_report for ALL ideas, not just rejected ones.
@@ -230,11 +231,13 @@ async def find_closest_existing_idea(
         FROM ideas
         WHERE client_id = $2
           AND embedding IS NOT NULL
+          AND id != $3
         ORDER BY embedding <=> $1::vector
         LIMIT 1
         """,
         embedding_str,
         client_id,
+        exclude_idea_id,
     )
     return dict(row) if row else None
 
@@ -392,7 +395,7 @@ async def _persist_batch(
     inserted = []
     async with conn.transaction():
         for idea in ideas:
-            idea_id = uuid.uuid4()
+            idea_id = uuid.UUID(str(idea.get("_candidate_id"))) if idea.get("_candidate_id") else uuid.uuid4()
             await conn.execute(
                 """
                 INSERT INTO ideas (
@@ -423,7 +426,8 @@ async def _persist_batch(
                 idea.get("score_reasoning"),
                 "pending",
             )
-            inserted.append({"id": str(idea_id), **idea})
+            clean_idea = {k: v for k, v in idea.items() if not k.startswith("_")}
+            inserted.append({"id": str(idea_id), **clean_idea})
     return inserted
 
 
@@ -476,9 +480,13 @@ async def generate_ideas(
 
     # 6. Embedding dedup: batch-embed all valid ideas, then filter near-duplicates
     dedup_rejected: list[dict] = []
+    dedup_results: list[dict] = []
     dedup_report: list[dict] = []
     ideas_to_persist = valid
     embeddings_to_store: list[list[float]] | None = None
+
+    for idea in valid:
+        idea.setdefault("_candidate_id", str(uuid.uuid4()))
 
     try:
         from embeddings import get_embeddings_batch, idea_to_embed_text
@@ -490,22 +498,36 @@ async def generate_ideas(
         dedup_embeddings = []
         for idea, emb in zip(valid, all_embeddings):
             emb_str = "[" + ",".join(str(x) for x in emb) + "]"
-            closest = await find_closest_existing_idea(conn, client_id, emb_str)
+            candidate_id = uuid.UUID(str(idea["_candidate_id"]))
+            closest = await find_closest_existing_idea(conn, client_id, emb_str, candidate_id)
 
             sim = round(float(closest["similarity"]), 4) if closest else 0.0
-            is_rejected = closest is not None and sim > DEDUP_THRESHOLD
+            is_rejected = closest is not None and sim >= DEDUP_THRESHOLD
+            dedup_status = "REJECTED" if is_rejected else "KEPT"
+
+            dedup_results.append({
+                "idea_id": str(candidate_id),
+                "hook": idea["hook"],
+                "closest_match_hook": closest["hook"] if closest else None,
+                "closest_match_id": str(closest["id"]) if closest else None,
+                "similarity_score": sim,
+                "dedup_status": dedup_status,
+                "similarity_threshold": DEDUP_THRESHOLD,
+            })
 
             dedup_report.append({
+                "idea_id": str(candidate_id),
                 "idea_hook": idea["hook"],
                 "closest_match_hook": closest["hook"] if closest else None,
                 "closest_match_id": str(closest["id"]) if closest else None,
                 "similarity_score": sim,
                 "threshold": DEDUP_THRESHOLD,
-                "status": "rejected" if is_rejected else "kept",
+                "status": dedup_status.lower(),
             })
 
             if is_rejected:
                 dedup_rejected.append({
+                    "idea_id": str(candidate_id),
                     "hook": idea["hook"],
                     "reason": "Too similar to existing idea",
                     "similar_to": closest["hook"],
@@ -521,6 +543,7 @@ async def generate_ideas(
 
     except Exception as e:
         print(f"  WARNING: Embedding/dedup failed, skipping dedup: {e}")
+        dedup_results = []
         dedup_report = []
 
     # 7. Persist
@@ -552,7 +575,14 @@ async def generate_ideas(
         "generated": len(inserted),
         "rejected": rejected,
         "dedup_rejected": dedup_rejected,
+        "dedup_results": dedup_results,
         "dedup_report": dedup_report,
+        "dedup_summary": {
+            "total_generated": len(valid),
+            "kept": len(inserted),
+            "rejected": len(dedup_rejected),
+            "threshold": DEDUP_THRESHOLD,
+        },
         "stats": {
             "total_generated": len(valid),
             "kept": len(inserted),

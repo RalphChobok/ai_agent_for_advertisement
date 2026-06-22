@@ -1,4 +1,5 @@
 import io
+import json
 import uuid
 from datetime import date
 from typing import Optional
@@ -7,6 +8,58 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 router = APIRouter()
+
+
+def _coerce_json_object(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _normalize_quality_review(row) -> dict:
+    feedback = _coerce_json_object(row["feedback"])
+    raw_items = feedback.get("items")
+    items = []
+
+    for index, item in enumerate(raw_items or [], start=1):
+        item_number = item.get("item_number") or item.get("number") or index
+        criterion = (
+            item.get("criterion")
+            or item.get("item_name")
+            or item.get("name")
+            or f"Criterion {item_number}"
+        )
+        reasoning = item.get("reasoning") or item.get("reason") or item.get("notes") or ""
+        items.append(
+            {
+                "criterion": criterion,
+                "passed": bool(item.get("passed")),
+                "reasoning": reasoning,
+            }
+        )
+
+    passed_count = sum(1 for item in items if item["passed"])
+    if not items and row["score"] is not None:
+        passed_count = int(row["score"])
+
+    overall_pass = row["passed"]
+    if overall_pass is None and isinstance(feedback, dict):
+        overall_pass = feedback.get("passed")
+
+    return {
+        "script_id": str(row["script_id"]),
+        "overall_pass": bool(overall_pass),
+        "passed_count": passed_count,
+        "total_count": len(items),
+        "items": items,
+        "overall_notes": feedback.get("overall_notes") if isinstance(feedback, dict) else None,
+    }
 
 
 @router.get("/clients/{client_id}/scripts")
@@ -83,10 +136,35 @@ async def list_client_scripts(
                 for pid in (row["proof_point_ids"] or [])
                 if str(pid) in proof_map
             ]
+            s["review_feedback"] = _coerce_json_object(s["review_feedback"]) if s.get("review_feedback") else None
             del s["proof_point_ids"]
             scripts.append(s)
 
         return scripts
+
+
+@router.get("/scripts/{script_id}/quality-review")
+async def get_script_quality_review(
+    script_id: uuid.UUID,
+    request: Request,
+):
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT script_id, passed, score, feedback
+            FROM quality_reviews
+            WHERE script_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            script_id,
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Quality review not found")
+
+    return _normalize_quality_review(row)
 
 
 @router.post("/clients/{client_id}/scripts/export-to-gdocs")

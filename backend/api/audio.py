@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import io
+import os
 import re
 import uuid
 import wave
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 router = APIRouter()
 
@@ -14,6 +16,7 @@ TTS_VOICE = "Enceladus"
 TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DIRECTOR_MODEL = "gemini-2.5-flash"
 CHUNK_MAX_CHARS = 800
+DEFAULT_AUDIO_DIR = Path(__file__).resolve().parent.parent / "generated_audio"
 
 _DIRECTOR_PROMPT = """You are an expert direct-response audio director. Take this specific ad copy text and rewrite it into an optimized Speech Synthesis format.
 Keep every single word identical, but insert explicit timing flags using `<break time="XXXms"/>` tags.
@@ -135,9 +138,66 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
     return buf.getvalue()
 
 
+def _audio_dir() -> Path:
+    directory = Path(os.getenv("AUDIO_OUTPUT_DIR", DEFAULT_AUDIO_DIR))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _audio_filename(script_id: uuid.UUID, hook_number: int) -> str:
+    return f"script_{script_id}_hook{hook_number}.wav"
+
+
+def _audio_path(script_id: uuid.UUID, hook_number: int) -> Path:
+    return _audio_dir() / _audio_filename(script_id, hook_number)
+
+
+def _audio_entry(script_id: uuid.UUID, hook_number: int, path: Path) -> dict:
+    filename = path.name
+    return {
+        "id": f"{script_id}-hook-{hook_number}",
+        "hook_index": hook_number,
+        "label": f"Hook {hook_number} + Body",
+        "file_path": str(path),
+        "url": f"/api/audio/{filename}",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
+
+@router.get("/scripts/{script_id}/audio")
+async def list_script_audio(
+    script_id: uuid.UUID,
+    request: Request,
+):
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM scripts WHERE id = $1)", script_id)
+
+    if not exists:
+        raise HTTPException(status_code=404, detail="Script not found")
+
+    entries = []
+    for hook_number in (1, 2, 3):
+        path = _audio_path(script_id, hook_number)
+        if path.exists():
+            entries.append(_audio_entry(script_id, hook_number, path))
+    return entries
+
+
+@router.get("/audio/{filename}")
+async def serve_audio_file(filename: str):
+    if "/" in filename or "\\" in filename or not filename.endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Invalid audio filename")
+
+    path = _audio_dir() / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+
+    return FileResponse(path, media_type="audio/wav", filename=filename)
+
 
 @router.post("/scripts/{script_id}/audio")
 async def generate_script_audio(
@@ -151,8 +211,6 @@ async def generate_script_audio(
     Production Notes and section labels are stripped; pacing tags are added
     via a Gemini director pass before synthesis.
     """
-    import os
-
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -166,6 +224,10 @@ async def generate_script_audio(
         )
     if not row:
         raise HTTPException(status_code=404, detail="Script not found")
+
+    output_path = _audio_path(script_id, hook_number)
+    if output_path.exists():
+        return FileResponse(output_path, media_type="audio/wav", filename=output_path.name)
 
     content = row["content"] or ""
     voice_hint = f"{row['brand']} — {row['voice_description'] or 'calm, unhurried, conversational, direct'}"
@@ -202,6 +264,8 @@ async def generate_script_audio(
         wav_bytes = await asyncio.to_thread(_generate)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {exc}")
+
+    output_path.write_bytes(wav_bytes)
 
     return StreamingResponse(
         io.BytesIO(wav_bytes),

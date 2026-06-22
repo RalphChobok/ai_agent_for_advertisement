@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   UploadCloud, Check, X, CheckCircle,
-  Loader2, RefreshCcw, Eye, Download, ArrowLeft, Zap, ChevronDown, ChevronRight,
+  Loader2, RefreshCcw, Eye, Download, ArrowLeft, Zap,
   Volume2,
 } from 'lucide-react';
 import logo from '../resources/client_accelerator_logo.png';
@@ -49,6 +49,14 @@ interface QualityReview {
   score: number;
   items: QualityReviewItem[];
   overall_notes: string;
+}
+
+interface AudioEntry {
+  id: string;
+  hook_index: number;
+  label: string;
+  file_path?: string;
+  url: string;
 }
 
 interface Script {
@@ -99,42 +107,73 @@ interface ExistingClient {
 }
 
 interface DedupReportEntry {
-  idea_hook: string;
+  idea_id: string;
+  hook: string;
   closest_match_hook: string | null;
   closest_match_id: string | null;
   similarity_score: number;
-  threshold: number;
-  status: 'kept' | 'rejected';
+  dedup_status: 'KEPT' | 'REJECTED';
+  similarity_threshold: number;
 }
 
-interface DedupBannerData {
-  batch_number: number;
-  generated: number;
-  dedup_rejected: number;
+interface DedupSummary {
   total_generated: number;
+  kept: number;
+  rejected: number;
   threshold: number;
-  exemplars_used: number;
+  previous_ideas_checked?: number;
 }
 
 type Step = 'upload' | 'analyzing' | 'review' | 'generating' | 'final';
 
+const truncateText = (value: string | null | undefined, max = 60) => {
+  if (!value) return 'None';
+  return value.length > max ? `${value.slice(0, max)}...` : value;
+};
+
+const similarityTone = (score: number, threshold: number) => {
+  if (score >= threshold) return 'duplicate';
+  if (score >= 0.6) return 'similar';
+  return 'unique';
+};
+
 // ---------------------------------------------------------------------------
-// ScriptDetailPanel — fixed popover showing idea details + quality review
-// Supports hover-preview (default) and click-to-pin modes
+// ScriptDetailPanel — hover preview or pinned delivery detail panel
 // ---------------------------------------------------------------------------
 
 interface ScriptDetailPanelProps {
   script: Script;
-  anchorRect: DOMRect;
+  anchorRect?: DOMRect;
   pinned: boolean;
   onClose: () => void;
+  audioEntries?: AudioEntry[];
+  audioLoading?: boolean;
+  audioGenerating?: Record<string, boolean>;
+  onGenerateAudio?: (scriptId: string) => void;
+  onGenerateHookAudio?: (scriptId: string, hookNumber: number) => void;
 }
 
-function ScriptDetailPanel({ script, anchorRect, pinned, onClose }: ScriptDetailPanelProps) {
+function ScriptDetailPanel({
+  script,
+  anchorRect,
+  pinned,
+  onClose,
+  audioEntries = [],
+  audioLoading = false,
+  audioGenerating = {},
+  onGenerateAudio,
+  onGenerateHookAudio,
+}: ScriptDetailPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
-  const [style, setStyle] = useState<React.CSSProperties>({ visibility: 'hidden' });
+  const [style, setStyle] = useState<React.CSSProperties>(pinned ? {} : { visibility: 'hidden' });
 
   useEffect(() => {
+    if (pinned) {
+      setStyle({});
+      return;
+    }
+    if (!anchorRect) return;
+
     const el = panelRef.current;
     if (!el) return;
     const popW = el.offsetWidth || 440;
@@ -152,15 +191,24 @@ function ScriptDetailPanel({ script, anchorRect, pinned, onClose }: ScriptDetail
     if (top < scrollY + 8) top = scrollY + 8;
 
     setStyle({ visibility: 'visible', left, top });
-  }, [anchorRect]);
+  }, [anchorRect, pinned]);
 
-  // Sort quality review items: failed first so problems are immediately visible
-  const sortedItems = script.review_feedback?.items
-    ? [...script.review_feedback.items].sort((a, b) => Number(a.passed) - Number(b.passed))
-    : [];
+  const reviewItems = script.review_feedback?.items || [];
+  const passedCount = script.review_feedback?.score ?? reviewItems.filter(item => item.passed).length;
+  const totalCount = reviewItems.length || 11;
+  const audioByHook = audioEntries.reduce<Record<number, AudioEntry>>((map, entry) => {
+    map[entry.hook_index] = entry;
+    return map;
+  }, {});
+  const hasAudio = audioEntries.length > 0;
+  const canShowAudio = pinned && (script.status === 'passed' || script.status === 'failed');
 
   return (
-    <div className={`script-panel${pinned ? ' pinned' : ''}`} ref={panelRef} style={style}>
+    <div
+      className={`script-panel ${pinned ? 'script-panel--pinned' : 'script-panel--hover'}`}
+      ref={panelRef}
+      style={style}
+    >
       {pinned && (
         <button className="script-panel-close" onClick={onClose} title="Close panel">
           <X size={14} />
@@ -222,14 +270,14 @@ function ScriptDetailPanel({ script, anchorRect, pinned, onClose }: ScriptDetail
           <div className="script-panel-section-title">
             Quality Review
             <span className={`script-panel-score ${script.review_feedback.passed ? 'passed' : 'failed'}`}>
-              {script.review_feedback.score}/{sortedItems.length || 11} passed
+              Passed {passedCount}/{totalCount}
             </span>
           </div>
           {script.review_feedback.overall_notes && (
             <p className="script-panel-notes">{script.review_feedback.overall_notes}</p>
           )}
           <div className="review-checklist">
-            {sortedItems.map(item => (
+            {reviewItems.map(item => (
               <div
                 key={item.item_number}
                 className={`review-checklist-item ${item.passed ? 'passed' : 'failed'}`}
@@ -247,6 +295,58 @@ function ScriptDetailPanel({ script, anchorRect, pinned, onClose }: ScriptDetail
 
       {!pinned && (
         <p className="script-panel-pin-hint">Click the status badge to pin this panel</p>
+      )}
+
+      {canShowAudio && (
+        <>
+          <div className="script-panel-divider" />
+          <div className="script-panel-section-title">
+            <Volume2 size={13} /> Audio
+          </div>
+          {audioLoading ? (
+            <div className="audio-empty">
+              <Loader2 size={14} className="spinner-inline" /> Checking audio...
+            </div>
+          ) : hasAudio ? (
+            <div className="audio-hooks">
+              {[1, 2, 3].map(hookNum => {
+                const entry = audioByHook[hookNum];
+                const loading = !!audioGenerating[`${script.script_id}-${hookNum}`];
+                return (
+                  <div key={hookNum} className="audio-hook-row">
+                    <span className="audio-hook-label">Hook {hookNum} + Body</span>
+                    {entry ? (
+                      <audio controls src={entry.url} className="audio-player" />
+                    ) : (
+                      <button
+                        className="btn-generate-audio"
+                        onClick={() => onGenerateHookAudio?.(script.script_id, hookNum)}
+                        disabled={loading}
+                      >
+                        {loading
+                          ? <><Loader2 size={13} className="spinner-inline" /> Generating...</>
+                          : <><Volume2 size={13} /> Generate</>}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="audio-empty">
+              <span>Audio not yet generated</span>
+              <button
+                className="btn-generate-audio"
+                onClick={() => onGenerateAudio?.(script.script_id)}
+                disabled={[1, 2, 3].some(hookNum => audioGenerating[`${script.script_id}-${hookNum}`])}
+              >
+                {[1, 2, 3].some(hookNum => audioGenerating[`${script.script_id}-${hookNum}`])
+                  ? <><Loader2 size={13} className="spinner-inline" /> Generating...</>
+                  : <><Volume2 size={13} /> Generate audio</>}
+              </button>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -266,7 +366,8 @@ function App() {
   const [scripts, setScripts] = useState<Script[]>([]);
   const [selectedScript, setSelectedScript] = useState<Script | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
-  const [audioUrls, setAudioUrls] = useState<Record<string, string>>({});
+  const [audioEntries, setAudioEntries] = useState<Record<string, AudioEntry[]>>({});
+  const [audioLoading, setAudioLoading] = useState<Record<string, boolean>>({});
   const [audioGenerating, setAudioGenerating] = useState<Record<string, boolean>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -275,18 +376,16 @@ function App() {
   const [batches, setBatches] = useState<IdeaBatch[]>([]);
   const [activeBatch, setActiveBatch] = useState<string>('all');
   const [generating, setGenerating] = useState(false);
-  const [dedupBanner, setDedupBanner] = useState<DedupBannerData | null>(null);
   const [dedupReport, setDedupReport] = useState<DedupReportEntry[]>([]);
-  const [dedupDetailsOpen, setDedupDetailsOpen] = useState(false);
+  const [dedupSummary, setDedupSummary] = useState<DedupSummary | null>(null);
+  const [dedupReportDismissed, setDedupReportDismissed] = useState(false);
   const [latestBatchId, setLatestBatchId] = useState<string | null>(null);
   const [existingClients, setExistingClients] = useState<ExistingClient[]>([]);
-  const bannerTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Script panel state (hover preview + click-to-pin)
   const [hoveredScript, setHoveredScript] = useState<Script | null>(null);
   const [hoverAnchor, setHoverAnchor] = useState<DOMRect | null>(null);
   const [pinnedScript, setPinnedScript] = useState<Script | null>(null);
-  const [pinnedAnchor, setPinnedAnchor] = useState<DOMRect | null>(null);
   const hoverTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ---- Derived state -------------------------------------------------------
@@ -310,8 +409,11 @@ function App() {
     scripts.some(s => s.status === 'pending_review') ||
     (step === 'final' && approvedIdeas.some(i => !scriptMap[i.id]));
 
-  // True when there's at least one dedup comparison to show
-  const hasDedupData = dedupReport.some(e => e.closest_match_hook !== null);
+  const showDedupReport = !!dedupSummary && !dedupReportDismissed;
+  const isFirstDedupRun =
+    !!dedupSummary &&
+    (dedupSummary.previous_ideas_checked === 0 ||
+      (dedupReport.length > 0 && dedupReport.every(e => e.closest_match_hook === null)));
 
   // ---- Data fetchers -------------------------------------------------------
 
@@ -351,6 +453,21 @@ function App() {
     } catch (err) { console.error('Failed to fetch scripts:', err); }
   };
 
+  const fetchAudioEntries = async (scriptId: string) => {
+    setAudioLoading(prev => ({ ...prev, [scriptId]: true }));
+    try {
+      const res = await fetch(`/api/scripts/${scriptId}/audio`);
+      if (!res.ok) throw new Error(`Audio lookup failed: ${res.status}`);
+      const entries = await res.json();
+      setAudioEntries(prev => ({ ...prev, [scriptId]: entries }));
+    } catch (err) {
+      console.error('Failed to fetch audio entries:', err);
+      setAudioEntries(prev => ({ ...prev, [scriptId]: [] }));
+    } finally {
+      setAudioLoading(prev => ({ ...prev, [scriptId]: false }));
+    }
+  };
+
   const generateAudio = async (scriptId: string, hookNumber: number) => {
     const key = `${scriptId}-${hookNumber}`;
     setAudioGenerating(prev => ({ ...prev, [key]: true }));
@@ -362,9 +479,7 @@ function App() {
         const err = await res.json().catch(() => ({ detail: 'Unknown error' }));
         throw new Error(err.detail || `Audio generation failed: ${res.status}`);
       }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      setAudioUrls(prev => ({ ...prev, [key]: url }));
+      await fetchAudioEntries(scriptId);
     } catch (err) {
       console.error('Audio generation failed:', err);
     } finally {
@@ -372,27 +487,49 @@ function App() {
     }
   };
 
+  const generateAllAudio = async (scriptId: string) => {
+    const existingHooks = new Set((audioEntries[scriptId] || []).map(entry => entry.hook_index));
+    const missingHooks = [1, 2, 3].filter(hookNum => !existingHooks.has(hookNum));
+    if (missingHooks.length === 0) return;
+    await Promise.all(missingHooks.map(hookNum => generateAudio(scriptId, hookNum)));
+    await fetchAudioEntries(scriptId);
+  };
+
   // ---- Consume generation response ----------------------------------------
 
   const applyGenResult = (data: Record<string, unknown>) => {
-    const report = (data.dedup_report as DedupReportEntry[]) || [];
+    const rawResults = (data.dedup_results as Record<string, unknown>[] | undefined)
+      || (data.dedup_report as Record<string, unknown>[] | undefined)
+      || [];
+    const report: DedupReportEntry[] = rawResults.map((entry, index) => {
+      const status = String(entry.dedup_status || entry.status || 'KEPT').toUpperCase();
+      const hook = String(entry.hook || entry.idea_hook || '');
+      return {
+        idea_id: String(entry.idea_id || `${hook}-${index}`),
+        hook,
+        closest_match_hook: (entry.closest_match_hook as string | null) ?? null,
+        closest_match_id: (entry.closest_match_id as string | null) ?? null,
+        similarity_score: Number(entry.similarity_score ?? 0),
+        dedup_status: status === 'REJECTED' ? 'REJECTED' : 'KEPT',
+        similarity_threshold: Number(entry.similarity_threshold ?? entry.threshold ?? 0.85),
+      };
+    });
     setDedupReport(report);
-    setDedupDetailsOpen(false);
+    setDedupReportDismissed(false);
 
     const apiStats = data.stats as { total_generated: number; kept: number; rejected_dedup: number } | undefined;
-    const threshold = report[0]?.threshold ?? 0.85;
+    const apiSummary = data.dedup_summary as Partial<DedupSummary> | undefined;
+    const learningContext = data.learning_context as { previous_ideas_checked?: number } | undefined;
+    const dedupRejected = data.dedup_rejected as unknown[] | undefined;
+    const threshold = Number(apiSummary?.threshold ?? report[0]?.similarity_threshold ?? 0.85);
 
-    setDedupBanner({
-      batch_number: data.batch_number as number,
-      generated: data.generated as number,
-      dedup_rejected: (data.dedup_rejected as unknown[])?.length || 0,
-      total_generated: apiStats?.total_generated ?? (data.generated as number),
+    setDedupSummary({
+      total_generated: Number(apiSummary?.total_generated ?? apiStats?.total_generated ?? data.generated ?? report.length ?? 0),
+      kept: Number(apiSummary?.kept ?? apiStats?.kept ?? data.generated ?? 0),
+      rejected: Number(apiSummary?.rejected ?? apiStats?.rejected_dedup ?? dedupRejected?.length ?? 0),
       threshold,
-      exemplars_used: (data.learning_context as { exemplars_used: number })?.exemplars_used || 0,
+      previous_ideas_checked: learningContext?.previous_ideas_checked,
     });
-
-    if (bannerTimeout.current) clearTimeout(bannerTimeout.current);
-    bannerTimeout.current = setTimeout(() => setDedupBanner(null), 12000);
   };
 
   // ---- Check for returning client on mount --------------------------------
@@ -507,6 +644,17 @@ function App() {
     return () => clearInterval(interval);
   }, [step, hasPendingScripts, clientId]);
 
+  useEffect(() => {
+    if (!pinnedScript) return;
+    if (pinnedScript.status !== 'passed' && pinnedScript.status !== 'failed') return;
+    fetchAudioEntries(pinnedScript.script_id);
+  }, [pinnedScript?.script_id]);
+
+  useEffect(() => {
+    if (!modalOpen || !selectedScript) return;
+    fetchAudioEntries(selectedScript.script_id);
+  }, [modalOpen, selectedScript?.script_id]);
+
   // ---- Navigation ----------------------------------------------------------
 
   const viewScripts = () => { setStep('generating'); setTimeout(() => setStep('final'), 600); };
@@ -528,11 +676,10 @@ function App() {
   const handleStatusCellClick = (e: React.MouseEvent, script: Script | undefined) => {
     if (!script) return;
     e.stopPropagation();
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     if (pinnedScript?.script_id === script.script_id) {
-      setPinnedScript(null); setPinnedAnchor(null);
+      setPinnedScript(null);
     } else {
-      setPinnedScript(script); setPinnedAnchor(rect);
+      setPinnedScript(script);
       setHoveredScript(null); setHoverAnchor(null);
     }
   };
@@ -574,10 +721,9 @@ function App() {
     setFile(null); setIdeas([]); setClientId(null); setUploadError(null);
     setScripts([]); setSelectedScript(null); setModalOpen(false);
     setStats(null); setBatches([]); setActiveBatch('all');
-    setDedupBanner(null); setDedupReport([]); setDedupDetailsOpen(false);
-    setLatestBatchId(null); setPinnedScript(null); setPinnedAnchor(null);
-    Object.values(audioUrls).forEach(url => URL.revokeObjectURL(url));
-    setAudioUrls({}); setAudioGenerating({});
+    setDedupSummary(null); setDedupReport([]); setDedupReportDismissed(false);
+    setLatestBatchId(null); setPinnedScript(null);
+    setAudioEntries({}); setAudioLoading({}); setAudioGenerating({});
     setStep('upload');
     fetch('/api/clients').then(r => r.ok ? r.json() : []).then(setExistingClients).catch(() => {});
   };
@@ -615,7 +761,7 @@ function App() {
   // ---- Render --------------------------------------------------------------
 
   return (
-    <div className="app-container">
+    <div className={`app-container ${step === 'final' ? 'app-container--delivery' : ''}`}>
       <header className="header">
         <div className="logo-wrapper">
           <img src={logo} alt="Client Accelerator" className="logo" />
@@ -701,62 +847,49 @@ function App() {
             </div>
           </div>
 
-          {/* Dedup run banner */}
-          {dedupBanner && (
-            <div className="run-banner">
-              <div className="run-banner-text">
-                <strong>Run {dedupBanner.batch_number} complete:</strong>{' '}
-                {dedupBanner.total_generated > 0
-                  ? <>Generated {dedupBanner.total_generated} → {dedupBanner.generated} kept
-                      {dedupBanner.dedup_rejected > 0 && <>, {dedupBanner.dedup_rejected} rejected as too similar (threshold: {Math.round(dedupBanner.threshold * 100)}%)</>}.
-                    </>
-                  : <>{dedupBanner.generated} ideas generated.</>}
-                {dedupBanner.exemplars_used > 0 && (
-                  <> Learning from {dedupBanner.exemplars_used} approved winner{dedupBanner.exemplars_used !== 1 ? 's' : ''}.</>
-                )}
-                {hasDedupData && (
-                  <button className="run-banner-toggle" onClick={() => setDedupDetailsOpen(v => !v)}>
-                    {dedupDetailsOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                    {dedupDetailsOpen ? 'Hide details' : 'Show similarity details'}
-                  </button>
-                )}
+          {/* Dedup report */}
+          {showDedupReport && dedupSummary && (
+            <section className="dedup-report-section">
+              <button className="dedup-report-dismiss" onClick={() => setDedupReportDismissed(true)}>
+                <X size={14} />
+              </button>
+              <div className="dedup-report-header">
+                <h3>Dedup Report</h3>
+                <p>
+                  Generated {dedupSummary.total_generated} · Kept {dedupSummary.kept} · Rejected {dedupSummary.rejected} · Threshold {dedupSummary.threshold.toFixed(2)}
+                </p>
               </div>
-              <button className="run-banner-dismiss" onClick={() => setDedupBanner(null)}><X size={14} /></button>
-            </div>
-          )}
-
-          {/* Expandable dedup details table */}
-          {dedupDetailsOpen && hasDedupData && (
-            <div className="dedup-details-section">
-              <div className="dedup-table-header">
-                <span>Generated idea</span>
-                <span>Closest existing</span>
-                <span>Sim</span>
-                <span>Result</span>
-              </div>
-              {[...dedupReport]
-                .sort((a, b) => (a.status === 'rejected' ? -1 : 1) - (b.status === 'rejected' ? -1 : 1))
-                .map((entry, i) => (
-                  <div key={i} className={`dedup-row dedup-row--${entry.status}`}>
-                    <span className="dedup-hook" title={entry.idea_hook}>
-                      {entry.idea_hook.length > 55 ? entry.idea_hook.slice(0, 55) + '…' : entry.idea_hook}
-                    </span>
-                    <span className="dedup-match" title={entry.closest_match_hook ?? ''}>
-                      {entry.closest_match_hook
-                        ? (entry.closest_match_hook.length > 55
-                          ? entry.closest_match_hook.slice(0, 55) + '…'
-                          : entry.closest_match_hook)
-                        : '—'}
-                    </span>
-                    <span className="dedup-sim">
-                      {entry.closest_match_hook ? `${Math.round(entry.similarity_score * 100)}%` : '—'}
-                    </span>
-                    <span className={`dedup-badge dedup-badge--${entry.status}`}>
-                      {entry.status.toUpperCase()}
-                    </span>
-                  </div>
-                ))}
-            </div>
+              {isFirstDedupRun ? (
+                <p className="dedup-first-run">
+                  First run — no prior ideas to compare against. Dedup not applicable.
+                </p>
+              ) : (
+                <div className="dedup-report-list">
+                  {dedupReport.map((entry) => {
+                    const tone = similarityTone(entry.similarity_score, entry.similarity_threshold);
+                    return (
+                      <div key={entry.idea_id} className={`dedup-report-row dedup-report-row--${entry.dedup_status.toLowerCase()}`}>
+                        <span className={`dedup-similarity-badge dedup-similarity-badge--${tone}`}>
+                          {entry.similarity_score.toFixed(2)}
+                        </span>
+                        <div className="dedup-report-copy">
+                          <div className="dedup-report-hook" title={entry.hook}>
+                            "{truncateText(entry.hook)}"
+                          </div>
+                          <div className="dedup-report-match" title={entry.closest_match_hook ?? ''}>
+                            → Closest: "{truncateText(entry.closest_match_hook)}" ({entry.similarity_score.toFixed(2)})
+                          </div>
+                        </div>
+                        <span className={`dedup-status-badge dedup-status-badge--${entry.dedup_status.toLowerCase()}`}>
+                          {entry.dedup_status === 'KEPT' ? <CheckCircle size={13} /> : <X size={13} />}
+                          {entry.dedup_status}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
           )}
 
           {/* Batch / run filter tabs */}
@@ -782,19 +915,19 @@ function App() {
               <div className="empty-state">No ideas match the current filter.</div>
             )}
             {filteredIdeas.map((idea) => {
-              const dedupEntry = dedupReport.find(e => e.idea_hook === idea.hook);
+              const dedupEntry = dedupReport.find(e => e.idea_id === idea.id || e.hook === idea.hook);
               const showSimPill = dedupEntry?.closest_match_hook != null;
               return (
                 <div key={idea.id} className={`idea-card ${idea.status !== 'pending' ? idea.status : ''}`}>
                   <div className="idea-hook-row">
                     <div className="idea-hook">{idea.hook}</div>
                     <div className="idea-hook-badges">
-                      {idea.batch_id === latestBatchId && latestBatchId && dedupBanner && (
+                      {idea.batch_id === latestBatchId && latestBatchId && (
                         <span className="badge-new">NEW</span>
                       )}
                       {showSimPill && (
                         <span
-                          className={`sim-pill ${dedupEntry!.status === 'rejected' ? 'sim-pill--rejected' : ''}`}
+                          className={`sim-pill sim-pill--${similarityTone(dedupEntry!.similarity_score, dedupEntry!.similarity_threshold)}`}
                           title={`Closest existing idea: "${dedupEntry!.closest_match_hook}"`}
                         >
                           Sim: {Math.round(dedupEntry!.similarity_score * 100)}%
@@ -907,62 +1040,81 @@ function App() {
             </div>
           </div>
 
-          <div className="delivery-table">
-            <div className="delivery-table-header">
-              <span>Hook</span>
-              <span>Angle / Type</span>
-              <span>ICE</span>
-              <span>Status</span>
-              <span></span>
-            </div>
-            {approvedIdeas.map((idea) => {
-              const script = scriptMap[idea.id];
-              const isPinned = pinnedScript?.script_id === script?.script_id;
-              return (
-                <div
-                  key={idea.id}
-                  className="delivery-row"
-                  onMouseEnter={(e) => handleRowMouseEnter(e, script)}
-                  onMouseLeave={handleRowMouseLeave}
-                >
-                  <div className="delivery-hook">
-                    {(idea.hook || '').length > 80 ? idea.hook.substring(0, 80) + '...' : idea.hook}
-                  </div>
-                  <div className="delivery-meta">
-                    {idea.angle_name && <span className="idea-tag tag-lead">{idea.angle_name}</span>}
-                    <span className="idea-tag tag-creative">{idea.creative_type}</span>
-                  </div>
-                  <div className="delivery-ice">
-                    I{idea.score_impact} C{idea.score_confidence} E{idea.score_ease}
-                  </div>
-                  <div
-                    className={`delivery-status-cell${script ? ' delivery-status-cell--clickable' : ''}`}
-                    onClick={(e) => handleStatusCellClick(e, script)}
-                    title={script ? (isPinned ? 'Click to unpin' : 'Click to pin details') : undefined}
-                  >
-                    <ScriptStatusBadge script={script} />
-                    {isPinned && <span className="pin-indicator" title="Pinned">📌</span>}
-                  </div>
-                  <div className="delivery-actions">
-                    {script && (
-                      <button className="btn-view" onClick={() => { setSelectedScript(script); setModalOpen(true); }}>
-                        <Eye size={14} /> View
-                      </button>
-                    )}
-                  </div>
+          <div className={`delivery-layout ${pinnedScript ? 'delivery-layout--with-panel' : ''}`}>
+            <div className="delivery-main">
+              <div className="delivery-table">
+                <div className="delivery-table-header">
+                  <span>Hook</span>
+                  <span>Angle / Type</span>
+                  <span>ICE</span>
+                  <span>Status</span>
+                  <span></span>
                 </div>
-              );
-            })}
-          </div>
+                {approvedIdeas.map((idea) => {
+                  const script = scriptMap[idea.id];
+                  const isPinned = pinnedScript?.script_id === script?.script_id;
+                  return (
+                    <div
+                      key={idea.id}
+                      className="delivery-row"
+                      onMouseEnter={(e) => handleRowMouseEnter(e, script)}
+                      onMouseLeave={handleRowMouseLeave}
+                    >
+                      <div className="delivery-hook">
+                        {(idea.hook || '').length > 80 ? idea.hook.substring(0, 80) + '...' : idea.hook}
+                      </div>
+                      <div className="delivery-meta">
+                        {idea.angle_name && <span className="idea-tag tag-lead">{idea.angle_name}</span>}
+                        <span className="idea-tag tag-creative">{idea.creative_type}</span>
+                      </div>
+                      <div className="delivery-ice">
+                        I{idea.score_impact} C{idea.score_confidence} E{idea.score_ease}
+                      </div>
+                      <div
+                        className={`delivery-status-cell${script ? ' delivery-status-cell--clickable' : ''}`}
+                        onClick={(e) => handleStatusCellClick(e, script)}
+                        title={script ? (isPinned ? 'Click to unpin' : 'Click to pin details') : undefined}
+                      >
+                        <ScriptStatusBadge script={script} />
+                        {isPinned && <span className="pin-indicator" title="Pinned">📌</span>}
+                      </div>
+                      <div className="delivery-actions">
+                        {script && (
+                          <button className="btn-view" onClick={() => { setSelectedScript(script); setModalOpen(true); }}>
+                            <Eye size={14} /> View
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
 
-          {scripts.some(s => s.status === 'failed') && !hasPendingScripts && (
-            <div className="failed-hint">
-              Some scripts didn't pass quality review.{' '}
-              <button className="failed-hint-link" onClick={backToIdeas}>
-                Generate more ideas →
-              </button>
+              {scripts.some(s => s.status === 'failed') && !hasPendingScripts && (
+                <div className="failed-hint">
+                  Some scripts didn't pass quality review.{' '}
+                  <button className="failed-hint-link" onClick={backToIdeas}>
+                    Generate more ideas →
+                  </button>
+                </div>
+              )}
             </div>
-          )}
+
+            {pinnedScript && (
+              <aside className="delivery-panel-slot">
+                <ScriptDetailPanel
+                  script={pinnedScript}
+                  pinned={true}
+                  onClose={() => setPinnedScript(null)}
+                  audioEntries={audioEntries[pinnedScript.script_id] || []}
+                  audioLoading={!!audioLoading[pinnedScript.script_id]}
+                  audioGenerating={audioGenerating}
+                  onGenerateAudio={generateAllAudio}
+                  onGenerateHookAudio={generateAudio}
+                />
+              </aside>
+            )}
+          </div>
 
           <div className="restart-section">
             <button className="btn-reject" onClick={restartProcess} style={{ margin: '0 auto' }}>
@@ -972,15 +1124,7 @@ function App() {
         </div>
       )}
 
-      {/* ── SCRIPT PANEL (hover preview or pinned) ── */}
-      {pinnedScript && pinnedAnchor && (
-        <ScriptDetailPanel
-          script={pinnedScript}
-          anchorRect={pinnedAnchor}
-          pinned={true}
-          onClose={() => { setPinnedScript(null); setPinnedAnchor(null); }}
-        />
-      )}
+      {/* ── SCRIPT PANEL (hover preview) ── */}
       {!pinnedScript && hoveredScript && hoverAnchor && (
         <ScriptDetailPanel
           script={hoveredScript}
@@ -1062,13 +1206,14 @@ function App() {
                 <div className="audio-hooks">
                   {[1, 2, 3].map(hookNum => {
                     const key = `${selectedScript.script_id}-${hookNum}`;
-                    const url = audioUrls[key];
+                    const entry = (audioEntries[selectedScript.script_id] || [])
+                      .find(audio => audio.hook_index === hookNum);
                     const loading = !!audioGenerating[key];
                     return (
                       <div key={hookNum} className="audio-hook-row">
-                        <span className="audio-hook-label">Hook {hookNum}</span>
-                        {url ? (
-                          <audio controls src={url} className="audio-player" />
+                        <span className="audio-hook-label">Hook {hookNum} + Body</span>
+                        {entry ? (
+                          <audio controls src={entry.url} className="audio-player" />
                         ) : (
                           <button
                             className="btn-generate-audio"
